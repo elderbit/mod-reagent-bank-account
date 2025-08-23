@@ -21,3 +21,18 @@ ReagentBankAccount.AccountWide = 0
 #        Default:     7
 #
 ReagentBankAccount.MaxOptionsPerPage = 7
+
+#    ReagentBankAccount.Audit
+#        Description: Enable audit logging of reagent deposits and withdrawals.
+#        Default: 0 (disabled)
+ReagentBankAccount.Audit = 0
+
+#    ReagentBankAccount.AuditRetentionSeconds
+#        Description: How long to retain audit rows (seconds) before pruning.
+#        Default: 604800 (7 days)
+ReagentBankAccount.AuditRetentionSeconds = 604800
+
+#    ReagentBankAccount.AuditCleanupIntervalSeconds
+#        Description: Minimum interval between automatic audit cleanup runs (seconds).
+#        Default: 3600 (1 hour)
+ReagentBankAccount.AuditCleanupIntervalSeconds = 3600

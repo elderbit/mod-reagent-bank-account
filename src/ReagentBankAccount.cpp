@@ -1,40 +1,153 @@
 #include "ReagentBankAccount.h"
 #include <unordered_map>
+#include <utility>
+#include <sstream>
+#include <mutex>
+#include <optional>
 
 uint32 g_maxOptionsPerPage;
 bool g_accountWideReagentBank = false;
+static bool g_reagentBankAudit = false;
+static uint32 g_reagentBankAuditRetentionSeconds = 7 * DAY;
+static uint32 g_reagentBankAuditCleanupIntervalSeconds = HOUR;
+static time_t g_reagentBankLastCleanup = 0;
 
 // AzerothCore module: Account-wide Reagent Bank
 // This script adds a reagent bank NPC that allows players to deposit and
 // withdraw reagents account-wide.
 
-class mod_reagent_bank_account : public CreatureScript {
+class mod_reagent_bank_account : public CreatureScript
+{
 private:
   // Caches for item templates and icons
   mutable std::unordered_map<uint32, const ItemTemplate *> itemTemplateCache;
   mutable std::unordered_map<uint32, std::string> itemIconCache;
+  // Per-player last viewed category & page (guid low -> pair(category, page))
+  mutable std::unordered_map<uint32, std::pair<uint32, uint16>> m_lastView;
+  mutable std::mutex m_mutex; // protects caches & m_lastView
+  // Cached category summaries (subclass -> (distinctItems, totalAmount))
+  mutable std::unordered_map<uint32, std::pair<uint32, uint64>> m_categorySummaryCache;
+  mutable bool m_cacheAllCategoriesInvalid = true;
+
+  struct ReagentCategoryInfo
+  {
+    uint32 subclass;
+    uint32 sampleIconItem; // representative item id for root menu icon
+    const char *name;
+  };
+
+  static constexpr ReagentCategoryInfo kCategories[] = {
+      {ITEM_SUBCLASS_CLOTH, 2589, "Cloth"},
+      {ITEM_SUBCLASS_MEAT, 12208, "Meat"},
+      {ITEM_SUBCLASS_METAL_STONE, 2772, "Metal & Stone"},
+      {ITEM_SUBCLASS_ENCHANTING, 10940, "Enchanting"},
+      {ITEM_SUBCLASS_ELEMENTAL, 7068, "Elemental"},
+      {ITEM_SUBCLASS_PARTS, 4359, "Parts"},
+      {ITEM_SUBCLASS_TRADE_GOODS_OTHER, 2604, "Other Trade Goods"},
+      {ITEM_SUBCLASS_HERB, 2453, "Herb"},
+      {ITEM_SUBCLASS_LEATHER, 2318, "Leather"},
+      {ITEM_SUBCLASS_JEWELCRAFTING, 1206, "Jewelcrafting"},
+      {ITEM_SUBCLASS_EXPLOSIVES, 4358, "Explosives"},
+      {ITEM_SUBCLASS_DEVICES, 4388, "Devices"},
+      {ITEM_SUBCLASS_MATERIAL, 23572, "Nether Material"},
+      {ITEM_SUBCLASS_ARMOR_ENCHANTMENT, 38682, "Armor Vellum"},
+      {ITEM_SUBCLASS_WEAPON_ENCHANTMENT, 39349, "Weapon Vellum"},
+  };
+
+  // Common icon item IDs (avoid scattered magic numbers)
+  static constexpr uint32 ICON_DEPOSIT_WITHDRAW = 2901; // pick style icon
+  static constexpr uint32 ICON_PAGINATION = 23705;      // arrow / nav icon
+  static constexpr uint32 ICON_BACK = 6948;             // hearthstone style
+
+  static const char *GetCategoryName(uint32 subclass)
+  {
+    for (auto const &c : kCategories)
+      if (c.subclass == subclass)
+        return c.name;
+    return "Reagents";
+  }
+
+  // Helper: category identification via metadata array
+  bool IsReagentCategory(uint32 value) const
+  {
+    for (auto const &c : kCategories)
+      if (c.subclass == value)
+        return true;
+    return false;
+  }
+
+  // Invalidate one category or all (subclass==0 => all)
+  void InvalidateCategorySummary(uint32 subclass)
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (subclass == 0)
+    {
+      m_categorySummaryCache.clear();
+      m_cacheAllCategoriesInvalid = true;
+    }
+    else
+    {
+      m_categorySummaryCache.erase(subclass);
+    }
+  }
+
+  std::optional<std::pair<uint32, uint64>> GetCachedCategorySummary(uint32 subclass) const
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto it = m_categorySummaryCache.find(subclass);
+    if (it != m_categorySummaryCache.end())
+      return it->second;
+    return std::nullopt;
+  }
+
+  void StoreCategorySummary(uint32 subclass, std::pair<uint32, uint64> summary) const
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_categorySummaryCache[subclass] = summary;
+    m_cacheAllCategoriesInvalid = false;
+  }
+
+  // Helper: resolve storage keys (account_id, guid) according to mode
+  std::pair<uint32, uint32> GetStorageKeys(Player *player) const
+  {
+    uint32 accountId = player->GetSession()->GetAccountId();
+    uint32 guid = g_accountWideReagentBank ? 0 : player->GetGUID().GetRawValue();
+    return {accountId, guid};
+  }
 
   // Get and cache ItemTemplate
-  const ItemTemplate *GetCachedItemTemplate(uint32 entry) const {
-    auto it = itemTemplateCache.find(entry);
-    if (it != itemTemplateCache.end())
-      return it->second;
+  const ItemTemplate *GetCachedItemTemplate(uint32 entry) const
+  {
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      auto it = itemTemplateCache.find(entry);
+      if (it != itemTemplateCache.end())
+        return it->second;
+    }
     const ItemTemplate *temp = sObjectMgr->GetItemTemplate(entry);
-    itemTemplateCache[entry] = temp;
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      itemTemplateCache[entry] = temp;
+    }
     return temp;
   }
 
   // Get and cache item icon string
   std::string GetCachedItemIcon(uint32 entry, uint32 width, uint32 height,
-                                int x, int y) const {
-    auto it = itemIconCache.find(entry);
-    if (it != itemIconCache.end())
-      return it->second;
+                                int x, int y) const
+  {
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      auto it = itemIconCache.find(entry);
+      if (it != itemIconCache.end())
+        return it->second;
+    }
     std::ostringstream ss;
     ss << "|TInterface";
     const ItemTemplate *temp = GetCachedItemTemplate(entry);
     const ItemDisplayInfoEntry *dispInfo = nullptr;
-    if (temp) {
+    if (temp)
+    {
       dispInfo = sItemDisplayInfoStore.LookupEntry(temp->DisplayInfoID);
       if (dispInfo)
         ss << "/ICONS/" << dispInfo->inventoryIcon;
@@ -43,17 +156,22 @@ private:
       ss << "/InventoryItems/WoWUnknownItem01";
     ss << ":" << width << ":" << height << ":" << x << ":" << y << "|t";
     std::string iconStr = ss.str();
-    itemIconCache[entry] = iconStr;
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      itemIconCache[entry] = iconStr;
+    }
     return iconStr;
   }
 
   // Returns a colored item link string for display in gossip menus (no cache,
   // as it may be locale-dependent)
-  std::string GetItemLink(uint32 entry, WorldSession *session) const {
+  std::string GetItemLink(uint32 entry, WorldSession *session) const
+  {
     int loc_idx = session->GetSessionDbLocaleIndex();
     const ItemTemplate *temp = GetCachedItemTemplate(entry);
     std::string name = temp ? temp->Name1 : "Unknown";
-    if (temp) {
+    if (temp)
+    {
       if (ItemLocale const *il = sObjectMgr->GetItemLocale(temp->ItemId))
         ObjectMgr::GetLocaleString(il->Name, loc_idx, name);
     }
@@ -67,543 +185,688 @@ private:
     return oss.str();
   }
 
-  // Withdraws a stack or all of a reagent from the account-wide bank for the
-  // player
-  void WithdrawItem(Player *player, uint32 entry) {
-    std::string idField = g_accountWideReagentBank ? "account_id" : "guid";
-    uint32 idValue = g_accountWideReagentBank
-                         ? player->GetSession()->GetAccountId()
-                         : player->GetGUID().GetRawValue();
-    uint32 otherIdValue =
-        g_accountWideReagentBank ? 0 : player->GetSession()->GetAccountId();
-    uint32 otherGuidValue =
-        g_accountWideReagentBank ? 0 : player->GetGUID().GetRawValue();
-
-    QueryResult result = CharacterDatabase.Query(
-        "SELECT amount FROM mod_reagent_bank_account WHERE account_id = %u AND "
-        "guid = %u AND item_entry = %u",
-        idValue, otherGuidValue, entry);
-    if (result) {
+  // Async single-item withdraw (reduces sync DB stall)
+  void WithdrawItem(Player *player, uint32 entry)
+  {
+    auto [accountId, guid] = GetStorageKeys(player);
+    WorldSession *session = player->GetSession();
+    ObjectGuid playerGuid = player->GetGUID();
+    std::string q = "SELECT amount FROM mod_reagent_bank_account WHERE account_id = " + std::to_string(accountId) + " AND guid = " + std::to_string(guid) + " AND item_entry = " + std::to_string(entry);
+    session->GetQueryProcessor().AddCallback(CharacterDatabase.AsyncQuery(q).WithCallback([=, this](QueryResult result)
+                                                                                          {
+      Player* p = ObjectAccessor::FindPlayer(playerGuid);
+      if (!p || !p->GetSession()) return;
+      if (!result)
+      {
+        ChatHandler(p->GetSession()).PSendSysMessage("No stored reagents for item %u.", entry);
+        return;
+      }
       uint32 storedAmount = (*result)[0].Get<uint32>();
       const ItemTemplate *temp = sObjectMgr->GetItemTemplate(entry);
-      if (!temp) {
-        ChatHandler(player->GetSession())
-            .PSendSysMessage("Error: Item template not found for entry %u.",
-                             entry);
+      if (!temp)
+      {
+        ChatHandler(p->GetSession()).PSendSysMessage("Error: Item template not found for entry %u.", entry);
         return;
       }
       uint32 stackSize = temp->GetMaxStackSize();
-      if (storedAmount <= stackSize) {
-        // Give the player all of the item and remove it from the DB
-        ItemPosCountVec dest;
-        InventoryResult msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest,
-                                                      entry, storedAmount);
-        if (msg == EQUIP_ERR_OK) {
-          CharacterDatabase.Execute(
-              "DELETE FROM mod_reagent_bank_account "
-              "WHERE account_id = {} AND guid = {} AND item_entry = {}",
-              idValue, otherGuidValue, entry);
-          Item *item = player->StoreNewItem(dest, entry, true);
-          player->SendNewItem(item, storedAmount, true, false);
-          ChatHandler(player->GetSession())
-              .PSendSysMessage("Withdrew %u x %s.", storedAmount,
-                               temp->Name1.c_str());
-        } else {
-          player->SendEquipError(msg, nullptr, nullptr, entry);
-          ChatHandler(player->GetSession())
-              .PSendSysMessage("Not enough bag space to withdraw %u x %s.",
-                               storedAmount, temp->Name1.c_str());
-          return;
+      if (storedAmount <= stackSize)
+      {
+        ItemPosCountVec dest; InventoryResult msg = p->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, entry, storedAmount);
+        if (msg == EQUIP_ERR_OK)
+        {
+          CharacterDatabase.Execute("DELETE FROM mod_reagent_bank_account WHERE account_id = {} AND guid = {} AND item_entry = {}", accountId, guid, entry);
+          if (Item* item = p->StoreNewItem(dest, entry, true)) p->SendNewItem(item, storedAmount, true, false);
+          ChatHandler(p->GetSession()).PSendSysMessage("Withdrew %u x %s.", storedAmount, temp->Name1.c_str());
+              // Invalidate only that item's subclass summary (need subclass lookup)
+              InvalidateCategorySummary(temp->SubClass);
         }
-      } else {
-        // Give the player a single stack
-        ItemPosCountVec dest;
-        InventoryResult msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest,
-                                                      entry, stackSize);
-        if (msg == EQUIP_ERR_OK) {
-          CharacterDatabase.Execute(
-              "UPDATE mod_reagent_bank_account SET amount = {} WHERE " +
-                  idField + " = {} AND item_entry = {}",
-              storedAmount - stackSize, idValue, entry);
-          Item *item = player->StoreNewItem(dest, entry, true);
-          player->SendNewItem(item, stackSize, true, false);
-          ChatHandler(player->GetSession())
-              .PSendSysMessage("Withdrew %u x %s.", stackSize,
-                               temp->Name1.c_str());
-        } else {
-          player->SendEquipError(msg, nullptr, nullptr, entry);
-          ChatHandler(player->GetSession())
-              .PSendSysMessage("Not enough bag space to withdraw %u x %s.",
-                               stackSize, temp->Name1.c_str());
-          return;
+        else
+        {
+          p->SendEquipError(msg, nullptr, nullptr, entry);
+          ChatHandler(p->GetSession()).PSendSysMessage("Not enough bag space to withdraw %u x %s.", storedAmount, temp->Name1.c_str());
         }
       }
+      else
+      {
+        ItemPosCountVec dest; InventoryResult msg = p->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, entry, stackSize);
+        if (msg == EQUIP_ERR_OK)
+        {
+          CharacterDatabase.Execute("UPDATE mod_reagent_bank_account SET amount = {} WHERE account_id = {} AND guid = {} AND item_entry = {}", storedAmount - stackSize, accountId, guid, entry);
+            if (Item* item = p->StoreNewItem(dest, entry, true)) p->SendNewItem(item, stackSize, true, false);
+            ChatHandler(p->GetSession()).PSendSysMessage("Withdrew %u x %s.", stackSize, temp->Name1.c_str());
+                InvalidateCategorySummary(temp->SubClass);
+        }
+        else
+        {
+          p->SendEquipError(msg, nullptr, nullptr, entry);
+          ChatHandler(p->GetSession()).PSendSysMessage("Not enough bag space to withdraw %u x %s.", stackSize, temp->Name1.c_str());
+        }
+      } }));
+  }
+
+  // Dry-run capacity simulator (approximate). Returns entry->canWithdrawAmount.
+  std::map<uint32, uint32> SimulateBatchAdd(Player *player, const std::vector<std::pair<uint32, uint32>> &items)
+  {
+    // Build mutable snapshot of current bag free space and partial stacks.
+    struct StackSlot
+    {
+      uint32 freeSpace;
+      Item *item;
+    };
+    // For each item entry, collect partial stacks (freeSpace > 0)
+    std::unordered_map<uint32, std::vector<StackSlot>> partial;
+    std::unordered_map<uint32, uint32> emptySlotsByFamily; // bagFamilyMask -> count (0 = generic)
+    // Scan backpack
+    auto scanBag = [&](uint8 bagPos, Bag *bag, uint32 size)
+    {
+      uint32 familyMask = bag ? bag->GetBagFamily() : 0;
+      for (uint32 slot = 0; slot < size; ++slot)
+      {
+        Item *it = player->GetItemByPos(bagPos, slot);
+        if (!it)
+        {
+          emptySlotsByFamily[familyMask]++;
+          continue;
+        }
+        ItemTemplate const *tmpl = it->GetTemplate();
+        if (!tmpl)
+          continue;
+        uint32 maxStack = tmpl->GetMaxStackSize();
+        if (maxStack <= 1)
+          continue; // ignore non-stackables for simulation
+        uint32 count = it->GetCount();
+        if (count < maxStack)
+        {
+          partial[tmpl->ItemId].push_back({maxStack - count, it});
+        }
+      }
+    };
+    // Backpack
+    for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+    {
+      Item *it = player->GetItemByPos(INVENTORY_SLOT_BAG_0, i);
+      if (!it)
+      {
+        emptySlotsByFamily[0]++;
+        continue;
+      }
+      ItemTemplate const *tmpl = it->GetTemplate();
+      if (!tmpl)
+        continue;
+      uint32 maxStack = tmpl->GetMaxStackSize();
+      if (maxStack <= 1)
+        continue;
+      uint32 count = it->GetCount();
+      if (count < maxStack)
+        partial[tmpl->ItemId].push_back({maxStack - count, it});
     }
+    // Other bags
+    for (uint8 bagPos = INVENTORY_SLOT_BAG_START; bagPos < INVENTORY_SLOT_BAG_END; ++bagPos)
+    {
+      if (Bag *bag = player->GetBagByPos(bagPos))
+        scanBag(bagPos, bag, bag->GetBagSize());
+    }
+    std::map<uint32, uint32> granted; // result map
+    // Process each requested item deterministically
+    for (auto const &pr : items)
+    {
+      uint32 entry = pr.first;
+      uint32 remaining = pr.second;
+      const ItemTemplate *temp = sObjectMgr->GetItemTemplate(entry);
+      if (!temp)
+        continue;
+      uint32 maxStack = temp->GetMaxStackSize();
+      if (maxStack == 0)
+        continue;
+      // Fill partial stacks first
+      auto &vec = partial[entry];
+      for (auto &slot : vec)
+      {
+        if (remaining == 0)
+          break;
+        uint32 use = std::min(slot.freeSpace, remaining);
+        slot.freeSpace -= use;
+        remaining -= use;
+        granted[entry] += use;
+      }
+      // Remove exhausted partial slots
+      vec.erase(std::remove_if(vec.begin(), vec.end(), [](StackSlot const &s)
+                               { return s.freeSpace == 0; }),
+                vec.end());
+      // Use empty slots to create new stacks
+      auto fitsSpecialty = [&](uint32 bagMask)
+      { return bagMask == 0 || (temp->GetBagFamily() & bagMask) != 0; };
+      while (remaining > 0)
+      {
+        bool placed = false;
+        // Try specialty first (non-zero masks)
+        for (auto &kv : emptySlotsByFamily)
+        {
+          if (kv.first == 0 || kv.second == 0)
+            continue;
+          if (!fitsSpecialty(kv.first))
+            continue;
+          uint32 create = std::min(maxStack, remaining);
+          remaining -= create;
+          granted[entry] += create;
+          kv.second--;
+          placed = true;
+          break;
+        }
+        if (!placed)
+        {
+          auto itEmpty = emptySlotsByFamily.find(0);
+          if (itEmpty == emptySlotsByFamily.end() || itEmpty->second == 0)
+            break; // no slot
+          uint32 create = std::min(maxStack, remaining);
+          remaining -= create;
+          granted[entry] += create;
+          itEmpty->second--;
+          placed = true;
+        }
+        if (!placed)
+          break;
+      }
+      // Any leftover remaining cannot be stored.
+    }
+    return granted;
+  }
+
+  // Fetch or build category summary
+  std::pair<uint32, uint64> GetCategorySummary(uint32 subclass, uint32 accountId, uint32 guid)
+  {
+    if (auto cached = GetCachedCategorySummary(subclass))
+      return *cached;
+    std::string q = "SELECT COUNT(*), COALESCE(SUM(amount),0) FROM mod_reagent_bank_account WHERE account_id = " + std::to_string(accountId) + " AND guid = " + std::to_string(guid) + " AND item_subclass = " + std::to_string(subclass);
+    if (QueryResult result = CharacterDatabase.Query(q))
+    {
+      uint32 distinctCount = (*result)[0].Get<uint32>();
+      uint64 totalAmount = (*result)[1].Get<uint64>();
+      StoreCategorySummary(subclass, {distinctCount, totalAmount});
+      return {distinctCount, totalAmount};
+    }
+    StoreCategorySummary(subclass, {0, 0});
+    return {0, 0};
   }
 
   // Updates the item count maps and removes the item from the player's
   // inventory
-  void UpdateItemCount(std::map<uint32, uint32> &entryToAmountMap,
-                       std::map<uint32, uint32> &entryToSubclassMap,
-                       std::map<uint32, uint32> &itemsAddedMap, Item *pItem,
-                       Player *player, uint32 bagSlot, uint32 itemSlot) {
-    uint32 count = pItem->GetCount();
-    ItemTemplate const *itemTemplate = pItem->GetTemplate();
+  struct AccumulateResult
+  {
+    std::map<uint32, uint32> addedCounts;     // counts just removed from bags
+    std::map<uint32, uint32> subclassByEntry; // subclass for each item
+  };
 
-    // Only allow trade goods and gems, and skip unique items
-    if (!(itemTemplate->Class == ITEM_CLASS_TRADE_GOODS ||
-          itemTemplate->Class == ITEM_CLASS_GEM) ||
-        itemTemplate->GetMaxStackSize() == 1)
+  // Iterate player inventory & bags, collect reagent items (optionally filtered by subclass), destroy them, and accumulate counts.
+  AccumulateResult AccumulateInventory(Player *player, std::optional<uint32> filterSubclass)
+  {
+    AccumulateResult result;
+
+    auto considerItem = [&](Item *pItem, uint32 bagSlot, uint32 itemSlot)
+    {
+      if (!pItem)
+        return;
+      ItemTemplate const *itemTemplate = pItem->GetTemplate();
+      if (!itemTemplate)
+        return;
+      // Only allow trade goods and gems, skip unique/stack size 1
+      if (!((itemTemplate->Class == ITEM_CLASS_TRADE_GOODS) || (itemTemplate->Class == ITEM_CLASS_GEM)))
+        return;
+      if (itemTemplate->GetMaxStackSize() == 1)
+        return;
+
+      uint32 subclass = (itemTemplate->Class == ITEM_CLASS_GEM) ? ITEM_SUBCLASS_JEWELCRAFTING : itemTemplate->SubClass;
+      if (filterSubclass && subclass != *filterSubclass)
+        return; // filtered out
+
+      uint32 entry = itemTemplate->ItemId;
+      uint32 count = pItem->GetCount();
+
+      result.addedCounts[entry] += count;
+      // only set subclass once
+      if (!result.subclassByEntry.count(entry))
+        result.subclassByEntry[entry] = subclass;
+
+      player->DestroyItem(bagSlot, itemSlot, true); // remove from inventory
+    };
+
+    // Inventory (backpack) slots
+    for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+      considerItem(player->GetItemByPos(INVENTORY_SLOT_BAG_0, i), INVENTORY_SLOT_BAG_0, i);
+
+    // Additional bags
+    for (uint8 bagPos = INVENTORY_SLOT_BAG_START; bagPos < INVENTORY_SLOT_BAG_END; ++bagPos)
+    {
+      if (Bag *bag = player->GetBagByPos(bagPos))
+      {
+        for (uint32 slot = 0; slot < bag->GetBagSize(); ++slot)
+          considerItem(player->GetItemByPos(bagPos, slot), bagPos, slot);
+      }
+    }
+
+    return result;
+  }
+
+  // Flush merged reagent state to DB using INSERT ... ON DUPLICATE KEY UPDATE (avoids DELETE+INSERT of REPLACE)
+  void FlushReagentState(uint32 accountId, uint32 guid, const std::map<uint32, uint32> &finalAmounts, const std::map<uint32, uint32> &subclassByEntry)
+  {
+    if (finalAmounts.empty())
       return;
-    uint32 itemEntry = itemTemplate->ItemId;
-    uint32 itemSubclass = itemTemplate->SubClass;
-
-    // Put gems to ITEM_SUBCLASS_JEWELCRAFTING section
-    if (itemTemplate->Class == ITEM_CLASS_GEM) {
-      itemSubclass = ITEM_SUBCLASS_JEWELCRAFTING;
+    auto trans = CharacterDatabase.BeginTransaction();
+    for (auto const &kv : finalAmounts)
+    {
+      uint32 entry = kv.first;
+      uint32 amount = kv.second;
+      auto it = subclassByEntry.find(entry);
+      uint32 subclass = (it != subclassByEntry.end()) ? it->second : 0;
+      trans->Append("INSERT INTO mod_reagent_bank_account (account_id, guid, item_entry, item_subclass, amount) VALUES ({}, {}, {}, {}, {}) ON DUPLICATE KEY UPDATE item_subclass=VALUES(item_subclass), amount=VALUES(amount)", accountId, guid, entry, subclass, amount);
     }
-
-    // Update or add to the amount and subclass maps
-    if (!entryToAmountMap.count(itemEntry)) {
-      entryToAmountMap[itemEntry] = count;
-      entryToSubclassMap[itemEntry] = itemSubclass;
-    } else {
-      uint32 existingCount = entryToAmountMap.find(itemEntry)->second;
-      entryToAmountMap[itemEntry] = existingCount + count;
-    }
-
-    // Track what was deposited for feedback
-    if (!itemsAddedMap.count(itemEntry)) {
-      itemsAddedMap[itemEntry] = count;
-    } else {
-      uint32 existingCount = itemsAddedMap.find(itemEntry)->second;
-      itemsAddedMap[itemEntry] = existingCount + count;
-    }
-
-    // Remove the item from the player's inventory
-    player->DestroyItem(bagSlot, itemSlot, true);
+    CharacterDatabase.CommitTransaction(trans);
   }
 
   // Deposits all reagents from the player's bags into the account-wide bank
-  void DepositAllReagents(Player *player) {
+  void DepositAllReagents(Player *player)
+  {
     WorldSession *session = player->GetSession();
-    std::string idField = g_accountWideReagentBank ? "account_id" : "guid";
-    uint32 idValue = g_accountWideReagentBank
-                         ? player->GetSession()->GetAccountId()
-                         : player->GetGUID().GetRawValue();
-
-    std::string query = "SELECT item_entry, item_subclass, amount FROM "
-                        "mod_reagent_bank_account WHERE " +
-                        idField + " = " + std::to_string(idValue);
+    auto [accountId, guid] = GetStorageKeys(player);
+    std::string query = "SELECT item_entry, item_subclass, amount FROM mod_reagent_bank_account WHERE account_id = " +
+                        std::to_string(accountId) + " AND guid = " + std::to_string(guid);
+    ObjectGuid playerGuid = player->GetGUID();
     session->GetQueryProcessor().AddCallback(
-        CharacterDatabase.AsyncQuery(query).WithCallback(
-            [=, this](QueryResult result) {
-              std::map<uint32, uint32> entryToAmountMap;
-              std::map<uint32, uint32> entryToSubclassMap;
-              std::map<uint32, uint32> itemsAddedMap;
-              if (result) {
-                do {
+        CharacterDatabase.AsyncQuery(query).WithCallback([=, this](QueryResult result)
+                                                         {
+              Player* playerPtr = ObjectAccessor::FindPlayer(playerGuid);
+              if (!playerPtr || !playerPtr->GetSession())
+                return; // player logged out
+              auto [accountId2, guid2] = GetStorageKeys(playerPtr);
+
+              // Load existing amounts
+              std::map<uint32, uint32> existingAmounts; // itemEntry -> amount
+              std::map<uint32, uint32> subclassByEntry; // from DB (for safety)
+              if (result)
+              {
+                do
+                {
                   uint32 itemEntry = (*result)[0].Get<uint32>();
                   uint32 itemSubclass = (*result)[1].Get<uint32>();
                   uint32 itemAmount = (*result)[2].Get<uint32>();
-                  entryToAmountMap[itemEntry] = itemAmount;
-                  entryToSubclassMap[itemEntry] = itemSubclass;
+                  existingAmounts[itemEntry] = itemAmount;
+                  subclassByEntry[itemEntry] = itemSubclass;
                 } while (result->NextRow());
               }
-              // Inventory Items
-              for (uint8 i = INVENTORY_SLOT_ITEM_START;
-                   i < INVENTORY_SLOT_ITEM_END; ++i) {
-                if (Item *pItem =
-                        player->GetItemByPos(INVENTORY_SLOT_BAG_0, i)) {
-                  UpdateItemCount(entryToAmountMap, entryToSubclassMap,
-                                  itemsAddedMap, pItem, player,
-                                  INVENTORY_SLOT_BAG_0, i);
-                }
-              }
-              // Bag Items
-              for (uint32 i = INVENTORY_SLOT_BAG_START;
-                   i < INVENTORY_SLOT_BAG_END; i++) {
-                Bag *bag = player->GetBagByPos(i);
-                if (!bag)
-                  continue;
-                for (uint32 j = 0; j < bag->GetBagSize(); j++) {
-                  if (Item *pItem = player->GetItemByPos(i, j)) {
-                    UpdateItemCount(entryToAmountMap, entryToSubclassMap,
-                                    itemsAddedMap, pItem, player, i, j);
+
+              // Accumulate new deposits from inventory (all subclasses)
+              AccumulateResult accum = AccumulateInventory(playerPtr, std::nullopt);
+
+              if (!accum.addedCounts.empty())
+              {
+                TC_LOG_DEBUG("misc", "ReagentBank Deposit logical batch account=%u guid=%u newEntries=%zu", accountId2, guid2, accum.addedCounts.size());
+                if (g_reagentBankAudit)
+                {
+                  auto audit = CharacterDatabase.BeginTransaction();
+                  for (auto const& kv : accum.addedCounts)
+                  {
+                    uint32 entryId = kv.first; uint32 delta = kv.second; uint32 subclass = accum.subclassByEntry.at(entryId);
+                    audit->Append("INSERT INTO mod_reagent_bank_audit (ts, account_id, guid, action, item_entry, item_subclass, delta) VALUES (UNIX_TIMESTAMP(), {}, {}, 'DEPOSIT', {}, {}, {})", accountId2, guid2, entryId, subclass, delta);
                   }
+                  CharacterDatabase.CommitTransaction(audit);
+                }
+                // Merge existing + new into final map
+                std::map<uint32, uint32> finalAmounts = existingAmounts;
+                for (auto const &kv : accum.addedCounts)
+                  finalAmounts[kv.first] = existingAmounts[kv.first] + kv.second;
+
+                // Build complete subclass map (prefer new subclass info)
+                std::map<uint32, uint32> mergedSubclass = subclassByEntry;
+                for (auto const &kv : accum.subclassByEntry)
+                  mergedSubclass[kv.first] = kv.second;
+
+                FlushReagentState(accountId2, guid2, finalAmounts, mergedSubclass);
+                // Invalidate only subclasses touched
+                std::set<uint32> touched;
+                for (auto const& kv : accum.subclassByEntry) touched.insert(kv.second);
+                for (auto sc : touched) InvalidateCategorySummary(sc);
+
+                ChatHandler(playerPtr->GetSession()).SendSysMessage("The following was deposited:");
+                for (auto const &kv : accum.addedCounts)
+                {
+                  uint32 itemEntry = kv.first;
+                  uint32 added = kv.second;
+                  if (ItemTemplate const *itemTemplate = sObjectMgr->GetItemTemplate(itemEntry))
+                    ChatHandler(playerPtr->GetSession()).SendSysMessage(std::to_string(added) + " " + itemTemplate->Name1);
                 }
               }
-              // Write all changes to the DB in a transaction
-              if (entryToAmountMap.size() != 0) {
-                auto trans = CharacterDatabase.BeginTransaction();
-                for (std::pair<uint32, uint32> mapEntry : entryToAmountMap) {
-                  uint32 itemEntry = mapEntry.first;
-                  uint32 itemAmount = mapEntry.second;
-                  uint32 itemSubclass =
-                      entryToSubclassMap.find(itemEntry)->second;
-                  trans->Append("REPLACE INTO mod_reagent_bank_account "
-                                "(account_id, guid, item_entry, item_subclass, "
-                                "amount) VALUES ({}, {}, {}, {}, {})",
-                                g_accountWideReagentBank ? idValue : 0,
-                                g_accountWideReagentBank ? 0 : idValue,
-                                itemEntry, itemSubclass, itemAmount);
-                }
-                CharacterDatabase.CommitTransaction(
-                    trans); // <-- just call, don't check return value
-              }
-              // Feedback to player
-              if (itemsAddedMap.size() != 0) {
-                ChatHandler(player->GetSession())
-                    .SendSysMessage("The following was deposited:");
-                for (std::pair<uint32, uint32> mapEntry : itemsAddedMap) {
-                  uint32 itemEntry = mapEntry.first;
-                  uint32 itemAmount = mapEntry.second;
-                  ItemTemplate const *itemTemplate =
-                      sObjectMgr->GetItemTemplate(itemEntry);
-                  std::string itemName = itemTemplate->Name1;
-                  ChatHandler(player->GetSession())
-                      .SendSysMessage(std::to_string(itemAmount) + " " +
-                                      itemName);
-                }
-              } else {
-                ChatHandler(player->GetSession())
-                    .PSendSysMessage("No reagents to deposit.");
-              }
-            }));
+              else
+              {
+                ChatHandler(playerPtr->GetSession()).PSendSysMessage("No reagents to deposit.");
+              } }));
 
     CloseGossipMenuFor(player);
   }
 
-  void DepositAllReagentsForCategory(Player *player, uint32 item_subclass) {
-    std::string idField = g_accountWideReagentBank ? "account_id" : "guid";
-    uint32 idValue = g_accountWideReagentBank
-                         ? player->GetSession()->GetAccountId()
-                         : player->GetGUID().GetRawValue();
-    uint32 otherGuidValue =
-        g_accountWideReagentBank ? 0 : player->GetGUID().GetRawValue();
+  void DepositAllReagentsForCategory(Player *player, uint32 item_subclass)
+  {
+    WorldSession *session = player->GetSession();
+    auto [accountId, guid] = GetStorageKeys(player);
+    std::string query = "SELECT item_entry, amount FROM mod_reagent_bank_account WHERE account_id = " + std::to_string(accountId) + " AND guid = " + std::to_string(guid) + " AND item_subclass = " + std::to_string(item_subclass);
+    ObjectGuid playerGuid = player->GetGUID();
+    session->GetQueryProcessor().AddCallback(
+        CharacterDatabase.AsyncQuery(query).WithCallback([=, this](QueryResult result)
+                                                         {
+              Player* playerPtr = ObjectAccessor::FindPlayer(playerGuid);
+              if (!playerPtr || !playerPtr->GetSession())
+                return;
+              auto [accountId2, guid2] = GetStorageKeys(playerPtr);
+              std::map<uint32, uint32> existingAmounts;
+              if (result)
+              {
+                do
+                {
+                  uint32 entry = (*result)[0].Get<uint32>();
+                  uint32 amount = (*result)[1].Get<uint32>();
+                  existingAmounts[entry] = amount;
+                } while (result->NextRow());
+              }
 
-    std::map<uint32, uint32> entryToAmountMap;
-    std::map<uint32, uint32> entryToSubclassMap;
-    std::map<uint32, uint32> itemsAddedMap;
+              AccumulateResult accum = AccumulateInventory(playerPtr, item_subclass);
 
-    // Inventory Items
-    for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END;
-         ++i) {
-      if (Item *pItem = player->GetItemByPos(INVENTORY_SLOT_BAG_0, i)) {
-        ItemTemplate const *itemTemplate = pItem->GetTemplate();
-        uint32 subclass = (itemTemplate->Class == ITEM_CLASS_GEM)
-                              ? ITEM_SUBCLASS_JEWELCRAFTING
-                              : itemTemplate->SubClass;
-        if ((itemTemplate->Class == ITEM_CLASS_TRADE_GOODS ||
-             itemTemplate->Class == ITEM_CLASS_GEM) &&
-            itemTemplate->GetMaxStackSize() > 1 && subclass == item_subclass) {
-          UpdateItemCount(entryToAmountMap, entryToSubclassMap, itemsAddedMap,
-                          pItem, player, INVENTORY_SLOT_BAG_0, i);
-        }
-      }
-    }
-    // Bag Items
-    for (uint32 i = INVENTORY_SLOT_BAG_START; i < INVENTORY_SLOT_BAG_END; i++) {
-      Bag *bag = player->GetBagByPos(i);
-      if (!bag)
-        continue;
-      for (uint32 j = 0; j < bag->GetBagSize(); j++) {
-        if (Item *pItem = player->GetItemByPos(i, j)) {
-          ItemTemplate const *itemTemplate = pItem->GetTemplate();
-          uint32 subclass = (itemTemplate->Class == ITEM_CLASS_GEM)
-                                ? ITEM_SUBCLASS_JEWELCRAFTING
-                                : itemTemplate->SubClass;
-          if ((itemTemplate->Class == ITEM_CLASS_TRADE_GOODS ||
-               itemTemplate->Class == ITEM_CLASS_GEM) &&
-              itemTemplate->GetMaxStackSize() > 1 &&
-              subclass == item_subclass) {
-            UpdateItemCount(entryToAmountMap, entryToSubclassMap, itemsAddedMap,
-                            pItem, player, i, j);
-          }
-        }
-      }
-    }
-    // Write all changes to the DB in a transaction
-    if (entryToAmountMap.size() != 0) {
-      auto trans = CharacterDatabase.BeginTransaction();
-      for (std::pair<uint32, uint32> mapEntry : entryToAmountMap) {
-        uint32 itemEntry = mapEntry.first;
-        uint32 itemAmount = mapEntry.second;
-        uint32 itemSubclass = entryToSubclassMap.find(itemEntry)->second;
-        trans->Append("REPLACE INTO mod_reagent_bank_account "
-                      "(account_id, guid, item_entry, item_subclass, amount) "
-                      "VALUES ({}, {}, {}, {}, {})",
-                      g_accountWideReagentBank ? idValue : 0,
-                      g_accountWideReagentBank ? 0 : idValue, itemEntry,
-                      itemSubclass, itemAmount);
-      }
-      CharacterDatabase.CommitTransaction(trans);
-    }
-    // Feedback to player
-    if (itemsAddedMap.size() != 0) {
-      ChatHandler(player->GetSession())
-          .SendSysMessage("The following was deposited:");
-      for (std::pair<uint32, uint32> mapEntry : itemsAddedMap) {
-        uint32 itemEntry = mapEntry.first;
-        uint32 itemAmount = mapEntry.second;
-        ItemTemplate const *itemTemplate =
-            sObjectMgr->GetItemTemplate(itemEntry);
-        std::string itemName = itemTemplate->Name1;
-        ChatHandler(player->GetSession())
-            .SendSysMessage(std::to_string(itemAmount) + " " + itemName);
-      }
-    } else {
-      ChatHandler(player->GetSession())
-          .PSendSysMessage("No reagents to deposit in this category.");
-    }
+              if (!accum.addedCounts.empty())
+              {
+                TC_LOG_DEBUG("misc", "ReagentBank DepositCategory logical batch account=%u guid=%u subclass=%u newEntries=%zu", accountId2, guid2, item_subclass, accum.addedCounts.size());
+                if (g_reagentBankAudit)
+                {
+                  auto audit = CharacterDatabase.BeginTransaction();
+                  for (auto const& kv : accum.addedCounts)
+                  {
+                    uint32 entryId = kv.first; uint32 delta = kv.second;
+                    audit->Append("INSERT INTO mod_reagent_bank_audit (ts, account_id, guid, action, item_entry, item_subclass, delta) VALUES (UNIX_TIMESTAMP(), {}, {}, 'DEPOSIT', {}, {}, {})", accountId2, guid2, entryId, item_subclass, delta);
+                  }
+                  CharacterDatabase.CommitTransaction(audit);
+                }
+                std::map<uint32, uint32> finalAmounts = existingAmounts;
+                for (auto const &kv : accum.addedCounts)
+                  finalAmounts[kv.first] = existingAmounts[kv.first] + kv.second;
+                // subclass map is uniform for this category
+                std::map<uint32, uint32> subclassMap;
+                for (auto const &kv : finalAmounts)
+                  subclassMap[kv.first] = item_subclass;
+                FlushReagentState(accountId2, guid2, finalAmounts, subclassMap);
+                InvalidateCategorySummary(item_subclass);
+
+                ChatHandler(playerPtr->GetSession()).SendSysMessage("The following was deposited:");
+                for (auto const &kv : accum.addedCounts)
+                {
+                  uint32 itemEntry = kv.first;
+                  uint32 added = kv.second;
+                  if (ItemTemplate const *itemTemplate = sObjectMgr->GetItemTemplate(itemEntry))
+                    ChatHandler(playerPtr->GetSession()).SendSysMessage(std::to_string(added) + " " + itemTemplate->Name1);
+                }
+              }
+              else
+              {
+                ChatHandler(playerPtr->GetSession()).PSendSysMessage("No reagents to deposit in this category.");
+              } }));
+
     CloseGossipMenuFor(player);
   }
 
   // Helper: Withdraw all items in a category for the player
-  void WithdrawAllInCategory(Player *player, uint32 item_subclass) {
-    std::string idField = g_accountWideReagentBank ? "account_id" : "guid";
-    uint32 idValue = g_accountWideReagentBank
-                         ? player->GetSession()->GetAccountId()
-                         : player->GetGUID().GetRawValue();
-    uint32 otherIdValue =
-        g_accountWideReagentBank ? 0 : player->GetSession()->GetAccountId();
-    uint32 otherGuidValue =
-        g_accountWideReagentBank ? 0 : player->GetGUID().GetRawValue();
-
-    QueryResult result = CharacterDatabase.Query(
-        "SELECT item_entry, amount FROM mod_reagent_bank_account WHERE " +
-        idField + " = " + std::to_string(idValue) +
-        " AND item_subclass = " + std::to_string(item_subclass));
-
-    if (!result) {
-      ChatHandler(player->GetSession())
-          .PSendSysMessage("No reagents to withdraw in this category.");
-      return;
-    }
-
-    bool anyWithdrawn = false;
-    do {
-      uint32 itemEntry = (*result)[0].Get<uint32>();
-      uint32 amount = (*result)[1].Get<uint32>();
-      const ItemTemplate *temp = sObjectMgr->GetItemTemplate(itemEntry);
-      if (!temp)
-        continue;
-
-      uint32 stackSize = temp->GetMaxStackSize();
-      uint32 remaining = amount;
-      while (remaining > 0) {
-        uint32 toGive = std::min(stackSize, remaining);
-        ItemPosCountVec dest;
-        InventoryResult msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest,
-                                                      itemEntry, toGive);
-        if (msg == EQUIP_ERR_OK) {
-          // Remove or update the reagent in the DB
-          if (toGive == remaining)
-            CharacterDatabase.Execute(
-                "DELETE FROM mod_reagent_bank_account WHERE " + idField +
-                    " = {} "
-                    "AND item_entry = {}",
-                idValue, itemEntry);
-          else
-            CharacterDatabase.Execute(
-                "UPDATE mod_reagent_bank_account SET amount = {} WHERE " +
-                    idField + " = {} AND item_entry = {}",
-                remaining - toGive, idValue, itemEntry);
-
-          Item *item = player->StoreNewItem(dest, itemEntry, true);
-          player->SendNewItem(item, toGive, true, false);
-          ChatHandler(player->GetSession())
-              .PSendSysMessage("Withdrew %u x %s.", toGive,
-                               temp->Name1.c_str());
-          anyWithdrawn = true;
-          remaining -= toGive;
-        } else {
-          player->SendEquipError(msg, nullptr, nullptr, itemEntry);
-          ChatHandler(player->GetSession())
-              .PSendSysMessage("Not enough bag space to withdraw %u x %s.",
-                               toGive, temp->Name1.c_str());
-          break;
+  void WithdrawAllInCategory(Player *player, uint32 item_subclass)
+  {
+    auto [accountId, guid] = GetStorageKeys(player);
+    WorldSession *session = player->GetSession();
+    ObjectGuid playerGuid = player->GetGUID();
+    std::string q = "SELECT item_entry, amount FROM mod_reagent_bank_account WHERE account_id = " + std::to_string(accountId) + " AND guid = " + std::to_string(guid) + " AND item_subclass = " + std::to_string(item_subclass);
+    session->GetQueryProcessor().AddCallback(CharacterDatabase.AsyncQuery(q).WithCallback([=, this](QueryResult result)
+                                                                                          {
+      Player* p = ObjectAccessor::FindPlayer(playerGuid);
+      if (!p || !p->GetSession()) return;
+      if (!result)
+      { ChatHandler(p->GetSession()).PSendSysMessage("No reagents to withdraw in this category."); return; }
+      // Copy rows to vector for simulation
+      std::vector<std::pair<uint32,uint32>> items;
+      do {
+        uint32 itemEntry = (*result)[0].Get<uint32>();
+        uint32 amount = (*result)[1].Get<uint32>();
+        items.emplace_back(itemEntry, amount);
+      } while (result->NextRow());
+      auto sim = SimulateBatchAdd(p, items);
+      bool any = false;
+      for (auto const& pr : items)
+      {
+        uint32 itemEntry = pr.first; uint32 amount = pr.second;
+        uint32 allowed = sim[itemEntry];
+        if (allowed == 0) continue;
+        const ItemTemplate* temp = sObjectMgr->GetItemTemplate(itemEntry);
+        if (!temp) continue;
+        uint32 stackSize = temp->GetMaxStackSize();
+        uint32 remainingToGive = allowed;
+        uint32 remainingBank = amount;
+        while (remainingToGive > 0)
+        {
+          uint32 toGive = std::min(stackSize, remainingToGive);
+          ItemPosCountVec dest; InventoryResult msg = p->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemEntry, toGive);
+          if (msg != EQUIP_ERR_OK) { p->SendEquipError(msg, nullptr, nullptr, itemEntry); break; }
+          if (Item* newItem = p->StoreNewItem(dest, itemEntry, true)) p->SendNewItem(newItem, toGive, true, false);
+          ChatHandler(p->GetSession()).PSendSysMessage("Withdrew %u x %s.", toGive, temp->Name1.c_str());
+          any = true;
+          remainingToGive -= toGive;
+          remainingBank -= toGive;
+        }
+        if (remainingBank == 0)
+          CharacterDatabase.Execute("DELETE FROM mod_reagent_bank_account WHERE account_id = {} AND guid = {} AND item_entry = {}", accountId, guid, itemEntry);
+        else if (remainingBank != amount)
+          CharacterDatabase.Execute("UPDATE mod_reagent_bank_account SET amount = {} WHERE account_id = {} AND guid = {} AND item_entry = {}", remainingBank, accountId, guid, itemEntry);
+        if (g_reagentBankAudit && allowed > 0)
+        {
+          CharacterDatabase.Execute("INSERT INTO mod_reagent_bank_audit (ts, account_id, guid, action, item_entry, item_subclass, delta) VALUES (UNIX_TIMESTAMP(), {}, {}, 'WITHDRAW', {}, {}, {})", accountId, guid, itemEntry, item_subclass, allowed);
         }
       }
-    } while (result->NextRow());
-
-    if (!anyWithdrawn)
-      ChatHandler(player->GetSession())
-          .PSendSysMessage("No reagents withdrawn.");
+      if (!any)
+        ChatHandler(p->GetSession()).PSendSysMessage("No reagents withdrawn (bag space).");
+      else
+      {
+        // Batch DB updates & audit inside one transaction
+        auto trans = CharacterDatabase.BeginTransaction();
+        for (auto const& pr : items)
+        {
+          uint32 itemEntry = pr.first; uint32 amount = pr.second; uint32 allowed = sim[itemEntry];
+          if (allowed == 0) continue; // no change
+          uint32 remainingBank = (amount > allowed) ? (amount - allowed) : 0;
+          if (remainingBank == 0)
+            trans->Append("DELETE FROM mod_reagent_bank_account WHERE account_id = {} AND guid = {} AND item_entry = {}", accountId, guid, itemEntry);
+          else if (remainingBank != amount)
+            trans->Append("UPDATE mod_reagent_bank_account SET amount = {} WHERE account_id = {} AND guid = {} AND item_entry = {}", remainingBank, accountId, guid, itemEntry);
+          if (g_reagentBankAudit && allowed > 0)
+            trans->Append("INSERT INTO mod_reagent_bank_audit (ts, account_id, guid, action, item_entry, item_subclass, delta) VALUES (UNIX_TIMESTAMP(), {}, {}, 'WITHDRAW', {}, {}, {})", accountId, guid, itemEntry, item_subclass, allowed);
+        }
+        CharacterDatabase.CommitTransaction(trans);
+  if (g_reagentBankAudit) EnsureAuditCleanup();
+  InvalidateCategorySummary(item_subclass);
+      } }));
   }
 
 public:
   // Constructor: reads config for max options per page
-  mod_reagent_bank_account() : CreatureScript("mod_reagent_bank_account") {
+  mod_reagent_bank_account() : CreatureScript("mod_reagent_bank_account")
+  {
     g_maxOptionsPerPage = sConfigMgr->GetOption<uint32>(
         "ReagentBankAccount.MaxOptionsPerPage", DEFAULT_MAX_OPTIONS);
     g_accountWideReagentBank =
         sConfigMgr->GetOption<bool>("ReagentBankAccount.AccountWide", false);
+    g_reagentBankAudit = sConfigMgr->GetOption<bool>("ReagentBankAccount.Audit", false);
+    g_reagentBankAuditRetentionSeconds = sConfigMgr->GetOption<uint32>("ReagentBankAccount.AuditRetentionSeconds", g_reagentBankAuditRetentionSeconds);
+    g_reagentBankAuditCleanupIntervalSeconds = sConfigMgr->GetOption<uint32>("ReagentBankAccount.AuditCleanupIntervalSeconds", g_reagentBankAuditCleanupIntervalSeconds);
+  }
+
+  void EnsureAuditCleanup()
+  {
+    if (!g_reagentBankAudit)
+      return;
+    time_t now = GameTime::GetGameTime();
+    if (g_reagentBankLastCleanup && (now - g_reagentBankLastCleanup) < g_reagentBankAuditCleanupIntervalSeconds)
+      return;
+    g_reagentBankLastCleanup = now;
+    time_t cutoff = now - g_reagentBankAuditRetentionSeconds;
+    CharacterDatabase.AsyncPQuery("DELETE FROM mod_reagent_bank_audit WHERE ts < {}", cutoff);
   }
 
   // Main menu for the reagent banker NPC
-  bool OnGossipHello(Player *player, Creature *creature) override {
+  bool OnGossipHello(Player *player, Creature *creature) override
+  {
     constexpr int MAIN_ICON_SIZE = 24;
     constexpr int MAIN_ICON_X = 0;
     constexpr int MAIN_ICON_Y = 0;
     constexpr int GOSSIP_ICON_NONE = 0;
-
-    AddGossipItemFor(player, GOSSIP_ICON_NONE, "Deposit All Reagents",
-                     DEPOSIT_ALL_REAGENTS, 0);
-    AddGossipItemFor(player, GOSSIP_ICON_NONE, "Withdraw All Reagents",
-                     WITHDRAW_ALL_REAGENTS, 0);
-    AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                     GetCachedItemIcon(2589, MAIN_ICON_SIZE, MAIN_ICON_SIZE,
-                                       MAIN_ICON_X, MAIN_ICON_Y) +
-                         "Cloth",
-                     ITEM_SUBCLASS_CLOTH, 0);
-    AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                     GetCachedItemIcon(12208, MAIN_ICON_SIZE, MAIN_ICON_SIZE,
-                                       MAIN_ICON_X, MAIN_ICON_Y) +
-                         "Meat",
-                     ITEM_SUBCLASS_MEAT, 0);
-    AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                     GetCachedItemIcon(2772, MAIN_ICON_SIZE, MAIN_ICON_SIZE,
-                                       MAIN_ICON_X, MAIN_ICON_Y) +
-                         "Metal & Stone",
-                     ITEM_SUBCLASS_METAL_STONE, 0);
-    AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                     GetCachedItemIcon(10940, MAIN_ICON_SIZE, MAIN_ICON_SIZE,
-                                       MAIN_ICON_X, MAIN_ICON_Y) +
-                         "Enchanting",
-                     ITEM_SUBCLASS_ENCHANTING, 0);
-    AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                     GetCachedItemIcon(7068, MAIN_ICON_SIZE, MAIN_ICON_SIZE,
-                                       MAIN_ICON_X, MAIN_ICON_Y) +
-                         "Elemental",
-                     ITEM_SUBCLASS_ELEMENTAL, 0);
-    AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                     GetCachedItemIcon(4359, MAIN_ICON_SIZE, MAIN_ICON_SIZE,
-                                       MAIN_ICON_X, MAIN_ICON_Y) +
-                         "Parts",
-                     ITEM_SUBCLASS_PARTS, 0);
-    AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                     GetCachedItemIcon(2604, MAIN_ICON_SIZE, MAIN_ICON_SIZE,
-                                       MAIN_ICON_X, MAIN_ICON_Y) +
-                         "Other Trade Goods",
-                     ITEM_SUBCLASS_TRADE_GOODS_OTHER, 0);
-    AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                     GetCachedItemIcon(2453, MAIN_ICON_SIZE, MAIN_ICON_SIZE,
-                                       MAIN_ICON_X, MAIN_ICON_Y) +
-                         "Herb",
-                     ITEM_SUBCLASS_HERB, 0);
-    AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                     GetCachedItemIcon(2318, MAIN_ICON_SIZE, MAIN_ICON_SIZE,
-                                       MAIN_ICON_X, MAIN_ICON_Y) +
-                         "Leather",
-                     ITEM_SUBCLASS_LEATHER, 0);
-    AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                     GetCachedItemIcon(1206, MAIN_ICON_SIZE, MAIN_ICON_SIZE,
-                                       MAIN_ICON_X, MAIN_ICON_Y) +
-                         "Jewelcrafting",
-                     ITEM_SUBCLASS_JEWELCRAFTING, 0);
-    AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                     GetCachedItemIcon(4358, MAIN_ICON_SIZE, MAIN_ICON_SIZE,
-                                       MAIN_ICON_X, MAIN_ICON_Y) +
-                         "Explosives",
-                     ITEM_SUBCLASS_EXPLOSIVES, 0);
-    AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                     GetCachedItemIcon(4388, MAIN_ICON_SIZE, MAIN_ICON_SIZE,
-                                       MAIN_ICON_X, MAIN_ICON_Y) +
-                         "Devices",
-                     ITEM_SUBCLASS_DEVICES, 0);
-    AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                     GetCachedItemIcon(23572, MAIN_ICON_SIZE, MAIN_ICON_SIZE,
-                                       MAIN_ICON_X, MAIN_ICON_Y) +
-                         "Nether Material",
-                     ITEM_SUBCLASS_MATERIAL, 0);
-    AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                     GetCachedItemIcon(38682, MAIN_ICON_SIZE, MAIN_ICON_SIZE,
-                                       MAIN_ICON_X, MAIN_ICON_Y) +
-                         "Armor Vellum",
-                     ITEM_SUBCLASS_ARMOR_ENCHANTMENT, 0);
-    AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                     GetCachedItemIcon(39349, MAIN_ICON_SIZE, MAIN_ICON_SIZE,
-                                       MAIN_ICON_X, MAIN_ICON_Y) +
-                         "Weapon Vellum",
-                     ITEM_SUBCLASS_WEAPON_ENCHANTMENT, 0);
-
-    SendGossipMenuFor(player, NPC_TEXT_ID, creature->GetGUID());
+    player->PlayerTalkClass->ClearMenus();
+    AddGossipItemFor(player, GOSSIP_ICON_NONE, "Deposit All Reagents", DEPOSIT_ALL_REAGENTS, 0);
+    AddGossipItemFor(player, GOSSIP_ICON_NONE, "Withdraw All Reagents", WITHDRAW_ALL_REAGENTS, 0);
+    auto [accountId, guid] = GetStorageKeys(player);
+    // Async aggregate query for all categories
+    std::ostringstream qs;
+    qs << "SELECT item_subclass, COUNT(*), COALESCE(SUM(amount),0) FROM mod_reagent_bank_account WHERE account_id=" << accountId << " AND guid=" << guid << " GROUP BY item_subclass";
+    ObjectGuid pg = player->GetGUID();
+    WorldSession *session = player->GetSession();
+    session->GetQueryProcessor().AddCallback(CharacterDatabase.AsyncQuery(qs.str()).WithCallback([=, this](QueryResult result)
+                                                                                                 {
+      Player* pl = ObjectAccessor::FindPlayer(pg); if (!pl || !pl->GetSession()) return; pl->PlayerTalkClass->ClearMenus();
+      AddGossipItemFor(pl, GOSSIP_ICON_NONE, "Deposit All Reagents", DEPOSIT_ALL_REAGENTS, 0);
+      AddGossipItemFor(pl, GOSSIP_ICON_NONE, "Withdraw All Reagents", WITHDRAW_ALL_REAGENTS, 0);
+      std::unordered_map<uint32, std::pair<uint32,uint64>> fresh;
+      if (result)
+      {
+        do {
+          uint32 sc = (*result)[0].Get<uint32>();
+          uint32 distinct = (*result)[1].Get<uint32>();
+          uint64 total = (*result)[2].Get<uint64>();
+          fresh[sc] = {distinct, total};
+        } while (result->NextRow());
+      }
+      // Store into cache
+      for (auto const& kv : fresh) StoreCategorySummary(kv.first, kv.second);
+      // Build menu using cache (zero default for missing)
+      for (auto const &info : kCategories)
+      {
+        auto cached = GetCachedCategorySummary(info.subclass);
+        uint32 distinctItems = cached ? cached->first : 0; uint64 totalAmount = cached ? cached->second : 0;
+        AddGossipItemFor(pl, GOSSIP_ICON_NONE,
+          GetCachedItemIcon(info.sampleIconItem, MAIN_ICON_SIZE, MAIN_ICON_SIZE, MAIN_ICON_X, MAIN_ICON_Y) + std::string(info.name) +
+          " |cff000000(" + std::to_string(distinctItems) + "/" + std::to_string(totalAmount) + ")|r",
+          info.subclass, 0);
+      }
+      SendGossipMenuFor(pl, NPC_TEXT_ID, pl->GetGUID()); }));
     return true;
   }
 
   // Handles menu selections and confirmation dialogs
   bool OnGossipSelect(Player *player, Creature *creature, uint32 item_subclass,
-                      uint32 gossipPageNumber) override {
+                      uint32 gossipPageNumber) override
+  {
     player->PlayerTalkClass->ClearMenus();
 
-    if (item_subclass == DEPOSIT_ALL_REAGENTS) {
-      if (gossipPageNumber == 0) {
+    if (item_subclass == DEPOSIT_ALL_REAGENTS)
+    {
+      if (gossipPageNumber == 0)
+      {
         // Main menu: deposit all categories
         DepositAllReagents(player);
-      } else {
+      }
+      else
+      {
         // Category menu: deposit only this category
         DepositAllReagentsForCategory(player, gossipPageNumber);
       }
       return true;
-    } else if (item_subclass == WITHDRAW_ALL_REAGENTS) {
-      if (gossipPageNumber == 0) {
+    }
+    else if (item_subclass == WITHDRAW_ALL_REAGENTS)
+    {
+      if (gossipPageNumber == 0)
+      {
         // Main menu: withdraw all categories
-        std::vector<uint32> subclasses = {ITEM_SUBCLASS_CLOTH,
-                                          ITEM_SUBCLASS_MEAT,
-                                          ITEM_SUBCLASS_METAL_STONE,
-                                          ITEM_SUBCLASS_ENCHANTING,
-                                          ITEM_SUBCLASS_ELEMENTAL,
-                                          ITEM_SUBCLASS_PARTS,
-                                          ITEM_SUBCLASS_TRADE_GOODS_OTHER,
-                                          ITEM_SUBCLASS_HERB,
-                                          ITEM_SUBCLASS_LEATHER,
-                                          ITEM_SUBCLASS_JEWELCRAFTING,
-                                          ITEM_SUBCLASS_EXPLOSIVES,
-                                          ITEM_SUBCLASS_DEVICES,
-                                          ITEM_SUBCLASS_MATERIAL,
-                                          ITEM_SUBCLASS_ARMOR_ENCHANTMENT,
-                                          ITEM_SUBCLASS_WEAPON_ENCHANTMENT};
-        for (uint32 subclass : subclasses)
-          WithdrawAllInCategory(player, subclass);
-      } else {
+        for (auto const &info : kCategories)
+          WithdrawAllInCategory(player, info.subclass);
+      }
+      else
+      {
         // Category menu: withdraw only this category
         WithdrawAllInCategory(player, gossipPageNumber);
       }
       CloseGossipMenuFor(player);
       return true;
-    } else if (item_subclass == MAIN_MENU) {
+    }
+    else if (item_subclass == MAIN_MENU)
+    {
       OnGossipHello(player, creature);
       return true;
-    } else {
-      ShowReagentItems(player, creature, item_subclass, gossipPageNumber);
+    }
+    else
+    {
+      // If this is a category, show items. Otherwise treat as item entry withdrawal.
+      if (IsReagentCategory(item_subclass))
+      {
+        ShowReagentItems(player, creature, item_subclass, gossipPageNumber);
+        return true;
+      }
+      // Withdraw single item entry (item_subclass actually holds itemEntry in this path)
+      WithdrawItem(player, item_subclass);
+      uint32 guidLow = player->GetGUID().GetCounter();
+      uint32 cat = 0;
+      uint16 page = 0;
+      bool haveContext = false;
+      {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_lastView.find(guidLow);
+        if (it != m_lastView.end())
+        {
+          cat = it->second.first;
+          page = it->second.second;
+          haveContext = true;
+        }
+      }
+      if (haveContext)
+        ShowReagentItems(player, creature, cat, page);
+      else
+        OnGossipHello(player, creature);
       return true;
     }
   }
 
   // Shows the list of stored reagents for a category, with pagination
   void ShowReagentItems(Player *player, Creature *creature,
-                        uint32 item_subclass, uint16 gossipPageNumber) {
+                        uint32 item_subclass, uint16 gossipPageNumber)
+  {
+    // Remember context for refresh after item withdrawal
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      m_lastView[player->GetGUID().GetCounter()] = {item_subclass, gossipPageNumber};
+    }
     WorldSession *session = player->GetSession();
-    std::string query =
-        "SELECT item_entry, amount FROM mod_reagent_bank_account WHERE "
-        "account_id = " +
-        std::to_string((g_accountWideReagentBank
-                            ? player->GetSession()->GetAccountId()
-                            : player->GetGUID().GetRawValue())) +
-        " AND item_subclass = " + std::to_string(item_subclass) +
-        " ORDER BY item_entry DESC";
+    auto [accountId, guid] = GetStorageKeys(player);
+    std::string query = "SELECT item_entry, amount FROM mod_reagent_bank_account WHERE account_id = " +
+                        std::to_string(accountId) + " AND guid = " + std::to_string(guid) +
+                        " AND item_subclass = " + std::to_string(item_subclass) +
+                        " ORDER BY item_entry DESC";
+    ObjectGuid playerGuid = player->GetGUID();
     session->GetQueryProcessor().AddCallback(
-        CharacterDatabase.AsyncQuery(query).WithCallback(
-            [=, this](QueryResult result) {
-              uint32 startValue = (gossipPageNumber * (g_maxOptionsPerPage));
-              uint32 endValue =
-                  (gossipPageNumber + 1) * (g_maxOptionsPerPage)-1;
+        CharacterDatabase.AsyncQuery(query).WithCallback([=, this](QueryResult result)
+                                                         {
+              Player* playerPtr = ObjectAccessor::FindPlayer(playerGuid);
+              if (!playerPtr || !playerPtr->GetSession())
+                return;
+              struct PageInfo { uint32 start; uint32 end; uint32 totalPages; uint32 currentPage; };
+              auto CalcPage = [&](uint32 totalItems, uint16 page)->PageInfo {
+                PageInfo p; p.currentPage = page + 1; // 1-based display
+                p.totalPages = (totalItems == 0) ? 1 : ((totalItems - 1) / g_maxOptionsPerPage) + 1;
+                p.start = page * g_maxOptionsPerPage;
+                p.end = std::min<uint32>(p.start + g_maxOptionsPerPage - 1, (totalItems==0)?0:(totalItems-1));
+                return p; };
               std::map<uint32, uint32> entryToAmountMap;
               std::vector<uint32> itemEntries;
               uint32 totalAmount = 0;
-              if (result) {
-                do {
+              if (result)
+              {
+                do
+                {
                   uint32 itemEntry = (*result)[0].Get<uint32>();
                   uint32 itemAmount = (*result)[1].Get<uint32>();
                   entryToAmountMap[itemEntry] = itemAmount;
@@ -613,114 +876,55 @@ public:
               }
 
               uint32 totalItems = itemEntries.size();
-              uint32 totalPages =
-                  (totalItems == 0)
-                      ? 1
-                      : ((totalItems - 1) / g_maxOptionsPerPage) + 1;
-              uint32 currentPage = gossipPageNumber + 1;
+              PageInfo pageInfo = CalcPage(totalItems, gossipPageNumber);
 
               // --- Category summary at the top ---
-              std::string categoryName;
-              switch (item_subclass) {
-              case ITEM_SUBCLASS_CLOTH:
-                categoryName = "Cloth";
-                break;
-              case ITEM_SUBCLASS_MEAT:
-                categoryName = "Meat";
-                break;
-              case ITEM_SUBCLASS_METAL_STONE:
-                categoryName = "Metal & Stone";
-                break;
-              case ITEM_SUBCLASS_ENCHANTING:
-                categoryName = "Enchanting";
-                break;
-              case ITEM_SUBCLASS_ELEMENTAL:
-                categoryName = "Elemental";
-                break;
-              case ITEM_SUBCLASS_PARTS:
-                categoryName = "Parts";
-                break;
-              case ITEM_SUBCLASS_TRADE_GOODS_OTHER:
-                categoryName = "Other Trade Goods";
-                break;
-              case ITEM_SUBCLASS_HERB:
-                categoryName = "Herb";
-                break;
-              case ITEM_SUBCLASS_LEATHER:
-                categoryName = "Leather";
-                break;
-              case ITEM_SUBCLASS_JEWELCRAFTING:
-                categoryName = "Jewelcrafting";
-                break;
-              case ITEM_SUBCLASS_EXPLOSIVES:
-                categoryName = "Explosives";
-                break;
-              case ITEM_SUBCLASS_DEVICES:
-                categoryName = "Devices";
-                break;
-              case ITEM_SUBCLASS_MATERIAL:
-                categoryName = "Nether Material";
-                break;
-              case ITEM_SUBCLASS_ARMOR_ENCHANTMENT:
-                categoryName = "Armor Vellum";
-                break;
-              case ITEM_SUBCLASS_WEAPON_ENCHANTMENT:
-                categoryName = "Weapon Vellum";
-                break;
-              default:
-                categoryName = "Reagents";
-                break;
-              }
+              std::string categoryName = GetCategoryName(item_subclass);
               // Consistent icon size and offset
               constexpr int ICON_SIZE = 18;
               constexpr int ICON_X = 0;
               constexpr int ICON_Y = 0;
               constexpr int GOSSIP_ICON_NONE = 0;
 
-              AddGossipItemFor(player, GOSSIP_ICON_NONE,
+              AddGossipItemFor(playerPtr, GOSSIP_ICON_NONE,
                                "|cff003366" + categoryName + ": " +
-                                   std::to_string(totalItems) + " types, " +
-                                   std::to_string(totalAmount) + " total|r",
+                                   std::to_string(totalItems) + " types, " + std::to_string(totalAmount) + " total|r",
                                0, 0);
 
               // Deposit All button (bold green, consistent icon)
-              AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                               GetCachedItemIcon(2901, ICON_SIZE, ICON_SIZE,
-                                                 ICON_X, ICON_Y) +
-                                   " |cff1eff00Deposit All|r",
+              AddGossipItemFor(playerPtr, GOSSIP_ICON_NONE,
+                               GetCachedItemIcon(ICON_DEPOSIT_WITHDRAW, ICON_SIZE, ICON_SIZE,
+                                                 ICON_X, ICON_Y) + " |cff1eff00Deposit All|r",
                                DEPOSIT_ALL_REAGENTS, item_subclass);
 
               // Withdraw All button (bold blue, consistent icon)
-              AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                               GetCachedItemIcon(2901, ICON_SIZE, ICON_SIZE,
-                                                 ICON_X, ICON_Y) +
-                                   " |cff0070ddWithdraw All|r",
+              AddGossipItemFor(playerPtr, GOSSIP_ICON_NONE,
+                               GetCachedItemIcon(ICON_DEPOSIT_WITHDRAW, ICON_SIZE, ICON_SIZE,
+                                                 ICON_X, ICON_Y) + " |cff0070ddWithdraw All|r",
                                WITHDRAW_ALL_REAGENTS, item_subclass);
 
               // Pagination controls (dark blue, consistent icon)
-              if (endValue < entryToAmountMap.size()) {
-                AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                                 GetCachedItemIcon(23705, ICON_SIZE, ICON_SIZE,
-                                                   ICON_X, ICON_Y) +
-                                     " |cff003366Next Page|r ▶ (" +
-                                     std::to_string(currentPage + 1) + "/" +
-                                     std::to_string(totalPages) + ")",
-                                 item_subclass, gossipPageNumber + 1);
+              if (pageInfo.end + 1 < entryToAmountMap.size())
+              {
+        AddGossipItemFor(playerPtr, GOSSIP_ICON_NONE,
+                 GetCachedItemIcon(ICON_PAGINATION, ICON_SIZE, ICON_SIZE,
+                           ICON_X, ICON_Y) + " |cff003366Next Page|r ▶ (" +
+                   std::to_string(pageInfo.currentPage + 1) + "/" + std::to_string(pageInfo.totalPages) + ")",
+                 item_subclass, gossipPageNumber + 1);
               }
-              if (gossipPageNumber > 0) {
-                AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                                 "◀ |cff003366Previous Page|r " +
-                                     GetCachedItemIcon(23705, ICON_SIZE,
-                                                       ICON_SIZE, ICON_X,
-                                                       ICON_Y) +
-                                     " (" + std::to_string(currentPage - 1) +
-                                     "/" + std::to_string(totalPages) + ")",
-                                 item_subclass, gossipPageNumber - 1);
+              if (gossipPageNumber > 0 && pageInfo.currentPage <= pageInfo.totalPages)
+              {
+        AddGossipItemFor(playerPtr, GOSSIP_ICON_NONE,
+                 "◀ |cff003366Previous Page|r " +
+                   GetCachedItemIcon(ICON_PAGINATION, ICON_SIZE, ICON_SIZE, ICON_X, ICON_Y) +
+                   " (" + std::to_string(pageInfo.currentPage - 1) + "/" + std::to_string(pageInfo.totalPages) + ")",
+                 item_subclass, gossipPageNumber - 1);
               }
 
               // List items for this page with icon, colored link, and count in
               // black
-              for (uint32 i = startValue; i <= endValue; i++) {
+              for (uint32 i = pageInfo.start; i <= pageInfo.end; ++i)
+              {
                 if (itemEntries.empty() || i > itemEntries.size() - 1)
                   break;
                 uint32 itemEntry = itemEntries.at(i);
@@ -732,21 +936,19 @@ public:
                                                      ICON_SIZE, ICON_X, ICON_Y);
 
                 // Compact display: [icon][Item Name] x amount (amount in black)
-                AddGossipItemFor(player, GOSSIP_ICON_NONE,
+                AddGossipItemFor(playerPtr, GOSSIP_ICON_NONE,
                                  icon + link + " |cff000000x " +
                                      std::to_string(amount) + "|r",
                                  itemEntry, gossipPageNumber);
               }
 
               // Back button to main menu (gray, consistent icon)
-              AddGossipItemFor(player, GOSSIP_ICON_NONE,
-                               GetCachedItemIcon(6948, ICON_SIZE, ICON_SIZE,
-                                                 ICON_X, ICON_Y) +
-                                   " |cff666666Back to Categories|r",
+              AddGossipItemFor(playerPtr, GOSSIP_ICON_NONE,
+                               GetCachedItemIcon(ICON_BACK, ICON_SIZE, ICON_SIZE,
+                                                 ICON_X, ICON_Y) + " |cff666666Back to Categories|r",
                                MAIN_MENU, 0);
 
-              SendGossipMenuFor(player, NPC_TEXT_ID, creature->GetGUID());
-            }));
+              SendGossipMenuFor(playerPtr, NPC_TEXT_ID, creature->GetGUID()); }));
   }
 };
 
